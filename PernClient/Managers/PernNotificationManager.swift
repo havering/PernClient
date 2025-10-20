@@ -27,7 +27,6 @@ class PernNotificationManager: NSObject, ObservableObject {
         ) { [weak self] _ in
             self?.isAppActive = true
             // Clear badge when app becomes active (user returned to the app)
-            print("🔄 App became active, clearing badge")
             self?.clearBadgeForActiveConnection()
         }
         
@@ -72,106 +71,54 @@ class PernNotificationManager: NSObject, ObservableObject {
     }
     
     func newMessageReceived(from connection: String, isActiveConnection: Bool = false) {
-        print("🔔 Current unread count before processing: \(unreadMessageCount)")
-        
         // Only increment badge if:
         // 1. App is not active (user switched to another app), OR
         // 2. This is not the currently active connection (user is looking at a different tab)
         if !isAppActive || !isActiveConnection {
             unreadMessageCount += 1
-            print("🔔 Incrementing badge - unread count is now: \(unreadMessageCount)")
             updateDockBadge()
-            forceDockBadgeUpdate() // Force update to ensure it works
-        } else {
-            print("🔔 User is actively using this connection - skipping badge increment")
         }
-    }
-    
-    private func updateBadge() {
-        print("🔔 Updating badge to: \(unreadMessageCount)")
-        
-        // Method 1: Direct dock tile approach
-        NSApplication.shared.dockTile.badgeLabel = unreadMessageCount > 0 ? "\(unreadMessageCount)" : ""
-        
-        // Method 2: UserNotifications framework approach
-        if unreadMessageCount > 0 {
-            let content = UNMutableNotificationContent()
-            content.badge = NSNumber(value: unreadMessageCount)
-            let request = UNNotificationRequest(identifier: "badge-update", content: content, trigger: nil)
-            notificationCenter.add(request) { error in
-                if let error = error {
-                    print("🔔 Badge notification error: \(error)")
-                } else {
-                    print("🔔 Badge notification set successfully")
-                }
-            }
-        } else {
-            notificationCenter.removeAllPendingNotificationRequests()
-            notificationCenter.removeAllDeliveredNotifications()
-        }
-        
-        print("🔔 Badge set to: '\(NSApplication.shared.dockTile.badgeLabel ?? "nil")'")
     }
     
     private func updateDockBadge() {
-        // Force update dock badge - this should work even without notification permission
-        DispatchQueue.main.async {
-            print("🔔 Force updating dock badge to: \(self.unreadMessageCount)")
-            
-            // Ensure the app is active in the dock and has proper activation policy
-            NSApplication.shared.setActivationPolicy(.regular)
-            
+        // Update on main thread if needed
+        let updateBlock = {
             // Set the badge
             let badgeText = self.unreadMessageCount > 0 ? "\(self.unreadMessageCount)" : ""
             NSApplication.shared.dockTile.badgeLabel = badgeText
+            NSApplication.shared.dockTile.display()
             
-            // Force a dock tile update with a slight delay to ensure it takes effect
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                NSApplication.shared.dockTile.display()
-                
-                // Debug: Check if the badge was actually set
-                let actualBadge = NSApplication.shared.dockTile.badgeLabel
-                print("🔔 Dock badge set to: '\(actualBadge ?? "nil")'")
-                print("🔔 Dock tile display called")
-                print("🔔 App activation policy: \(NSApplication.shared.activationPolicy().rawValue)")
-                print("🔔 App is active: \(NSApplication.shared.isActive)")
-                print("🔔 Dock tile badge: '\(NSApplication.shared.dockTile.badgeLabel ?? "nil")'")
+            // Clean up old notification requests
+            if self.unreadMessageCount == 0 {
+                self.notificationCenter.removeAllPendingNotificationRequests()
+                self.notificationCenter.removeAllDeliveredNotifications()
             }
+        }
+        
+        if Thread.isMainThread {
+            updateBlock()
+        } else {
+            DispatchQueue.main.async(execute: updateBlock)
         }
     }
     
     func clearBadge() {
-        print("🔔 Clearing badge - was \(unreadMessageCount)")
-        print("🔔 Clear badge called from: \(Thread.callStackSymbols[1])")
         unreadMessageCount = 0
         updateDockBadge()
     }
     
     func clearBadgeForActiveConnection() {
-        print("🔔 Clearing badge for active connection - was \(unreadMessageCount)")
         unreadMessageCount = 0
         updateDockBadge()
     }
     
     func forceDockBadgeUpdate() {
-        DispatchQueue.main.async {
-            let badgeText = self.unreadMessageCount > 0 ? "\(self.unreadMessageCount)" : ""
-            
-            // Set dock badge without activating the app
-            NSApplication.shared.dockTile.badgeLabel = badgeText
-            NSApplication.shared.dockTile.display()
-            
-            // Force dock refresh with a slight delay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                NSApplication.shared.dockTile.badgeLabel = badgeText
-                NSApplication.shared.dockTile.display()
-            }
-        }
+        // Simplified - just call updateDockBadge
+        updateDockBadge()
     }
     
     
     private func clearBadgeInternal() {
-        print("🔔 Clearing badge - was \(unreadMessageCount)")
         unreadMessageCount = 0
         updateDockBadge()
     }
@@ -180,7 +127,6 @@ class PernNotificationManager: NSObject, ObservableObject {
         // Check if we have notification permission first
         notificationCenter.getNotificationSettings { settings in
             guard settings.authorizationStatus == .authorized else {
-                print("ℹ️ Notifications not authorized, skipping notification")
                 return
             }
             
@@ -190,16 +136,15 @@ class PernNotificationManager: NSObject, ObservableObject {
             content.sound = .default
             content.badge = NSNumber(value: self.unreadMessageCount)
             
+            // Use fixed identifier to replace previous notification instead of accumulating
             let request = UNNotificationRequest(
-                identifier: "pern-message-\(Date().timeIntervalSince1970)",
+                identifier: "pern-message-notification",
                 content: content,
                 trigger: nil
             )
             
             self.notificationCenter.add(request) { error in
-                if let error = error {
-                    print("❌ Failed to show notification: \(error)")
-                }
+                // Silently handle errors
             }
         }
     }

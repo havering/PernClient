@@ -14,6 +14,7 @@ class PernConnectionManager: ObservableObject {
     @Published var isDarkMode: Bool = true
     
     let notificationManager = PernNotificationManager()
+    private var notificationObserver: NSObjectProtocol?
 
     private let userDefaults = UserDefaults.standard
     private let worldsKey = "PernWorlds"
@@ -33,25 +34,27 @@ class PernConnectionManager: ObservableObject {
     }
     
     private func setupNotificationObservers() {
-        NotificationCenter.default.addObserver(
+        notificationObserver = NotificationCenter.default.addObserver(
             forName: .newMessageReceived,
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            print("📨 Received notification in connection manager")
             if let userInfo = notification.userInfo,
                let connection = userInfo["connection"] as? String,
                let connectionId = userInfo["connectionId"] as? UUID {
-                print("📨 Calling notification manager for: \(connection)")
                 
                 // Only show notification if this is not the currently active connection
                 let isActiveConnection = connectionId == self?.activeConnectionId
-                print("📨 Is active connection: \(isActiveConnection)")
                 
                 self?.notificationManager.newMessageReceived(from: connection, isActiveConnection: isActiveConnection)
-            } else {
-                print("📨 No valid userInfo in notification")
             }
+        }
+    }
+    
+    deinit {
+        // Clean up notification observer
+        if let observer = notificationObserver {
+            NotificationCenter.default.removeObserver(observer)
         }
     }
     
@@ -187,10 +190,8 @@ class PernConnectionManager: ObservableObject {
     }
     
     func addCharacter(_ character: PernCharacter) {
-        print("💾 Adding character: \(character.name) for world: \(character.worldId)")
         characters.append(character)
         saveData()
-        print("💾 Characters count after adding: \(characters.count)")
     }
     
     func saveCharacter(_ character: PernCharacter) {
@@ -213,16 +214,12 @@ class PernConnectionManager: ObservableObject {
     }
     
     func saveHighlightRule(_ rule: HighlightRule) {
-        print("🔧 ConnectionManager: Saving rule '\(rule.pattern)' with color '\(rule.color)'")
         if let index = highlightRules.firstIndex(where: { $0.id == rule.id }) {
-            print("🔧 ConnectionManager: Updating existing rule at index \(index)")
             highlightRules[index] = rule
         } else {
-            print("🔧 ConnectionManager: Adding new rule")
             highlightRules.append(rule)
         }
         saveData()
-        print("🔧 ConnectionManager: Total rules now: \(highlightRules.count)")
     }
     
     func deleteHighlightRule(_ rule: HighlightRule) {

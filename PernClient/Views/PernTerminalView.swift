@@ -6,6 +6,9 @@ struct PernTerminalView: View {
     @FocusState private var isInputFocused: Bool
     @State private var scrollToBottom = false
     
+    // Regex caching for better performance
+    @StateObject private var highlightCache = HighlightCache()
+    
     var body: some View {
         VStack(spacing: 0) {
             // Connection Status Bar
@@ -90,18 +93,12 @@ struct PernTerminalView: View {
                     }
                 }
                 .onChange(of: connection.outputBuffer) {
-                    withAnimation(.easeOut(duration: 0.3)) {
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
-                }
-                .onChange(of: connection.lastActivity) {
-                    withAnimation(.easeOut(duration: 0.3)) {
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
+                    // Scroll without animation for better performance
+                    proxy.scrollTo("bottom", anchor: .bottom)
                 }
                 .onChange(of: connectionManager.highlightRules.count) { _ in
-                    // Force re-evaluation of highlighting when rules change
-                    print("🔍 Highlight rules changed, forcing re-evaluation")
+                    // Clear attributed string cache when rules change
+                    highlightCache.clearAttributedStringCache()
                 }
                 .onTapGesture {
                     // Don't clear badge on click - let user manually clear by switching tabs
@@ -159,12 +156,10 @@ struct PernTerminalView: View {
         .background(Color(NSColor.textBackgroundColor))
         .onAppear {
             // Clear badge when user views this terminal
-            print("🔄 Terminal view appeared, clearing badge")
             connectionManager.notificationManager.clearBadgeForActiveConnection()
         }
         .onTapGesture {
             // Clear badge when user taps on terminal
-            print("🔄 Terminal tapped, clearing badge")
             connectionManager.notificationManager.clearBadgeForActiveConnection()
         }
         .onChange(of: connection.isConnected) { _, isConnected in
@@ -180,7 +175,9 @@ struct PernTerminalView: View {
     private func sendCommand() {
         guard !connection.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         
-        connection.sendCommand(connection.inputText)
+        let commandToSend = connection.inputText
+        
+        connection.sendCommand(commandToSend)
         connection.inputText = ""
         
         // Don't clear badge on command send - let user manually clear by switching tabs
@@ -190,84 +187,55 @@ struct PernTerminalView: View {
     private func highlightedText(_ text: String) -> some View {
         let enabledRules = connectionManager.highlightRules.filter { $0.isEnabled }
         
-        print("🔍 Highlighting text with \(enabledRules.count) enabled rules")
-        for rule in enabledRules {
-            print("🔍 Enabled rule: '\(rule.pattern)' with color '\(rule.color)'")
-        }
-        
         if enabledRules.isEmpty {
             return AnyView(Text(text))
-        } else {
-            let attributedString = createAttributedString(from: text, rules: enabledRules)
-            return AnyView(Text(AttributedString(attributedString)))
         }
+        
+        // Check cache first
+        let cacheKey = "\(text.count)-\(enabledRules.map { $0.id.uuidString }.joined())"
+        
+        if let cached = highlightCache.getCachedAttributedString(for: cacheKey) {
+            return AnyView(Text(AttributedString(cached)))
+        }
+        
+        // Not in cache, create and cache it
+        let attributedString = createAttributedString(from: text, rules: enabledRules)
+        highlightCache.cacheAttributedString(attributedString, for: cacheKey)
+        
+        return AnyView(Text(AttributedString(attributedString)))
     }
     
     private func createAttributedString(from text: String, rules: [HighlightRule]) -> NSAttributedString {
         let attributedString = NSMutableAttributedString(string: text)
         
+        // Automatically highlight page messages in yellow
+        highlightPageMessages(in: attributedString, text: text)
+        
         for rule in rules {
-            print("🔍 Processing rule: '\(rule.pattern)'")
-            do {
-                // Check if this is a full-line pattern (starts with ^ and ends with $)
-                let isFullLinePattern = rule.pattern.hasPrefix("^") && rule.pattern.hasSuffix("$")
-                
-                if isFullLinePattern {
-                    // For full-line patterns, extract the core pattern (remove ^ and $)
-                    let corePattern = String(rule.pattern.dropFirst().dropLast())
-                    print("🔍 Full-line pattern detected, core pattern: '\(corePattern)'")
+            // Get or create cached regex
+            let regex = highlightCache.getRegex(for: rule.pattern)
+            guard let regex = regex else { continue }
+            
+            // Check if this is a full-line pattern (starts with ^ and ends with $)
+            let isFullLinePattern = rule.pattern.hasPrefix("^") && rule.pattern.hasSuffix("$")
+            
+            let searchRange = NSRange(location: 0, length: text.utf16.count)
+            let matches = regex.matches(in: text, options: [], range: searchRange)
+            
+            if isFullLinePattern {
+                for match in matches.reversed() {
+                    let color = colorForRule(rule)
                     
-                    // Use the core pattern to find matches anywhere in the text
-                    let regex = try NSRegularExpression(pattern: corePattern, options: [.caseInsensitive])
-                    let range = NSRange(location: 0, length: text.utf16.count)
-                    let matches = regex.matches(in: text, options: [], range: range)
-                    
-                    print("🔍 Found \(matches.count) matches for core pattern '\(corePattern)'")
-                    print("🔍 Text being searched: '\(text.prefix(100))...'")
-                    
-                    for match in matches.reversed() {
-                        let color = colorForRule(rule)
-                        
-                        // Find the line boundaries and highlight the entire line
-                        let lineRange = findLineRange(for: match.range, in: text)
-                        attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: lineRange)
-                        print("🔍 Highlighting full line: \(lineRange)")
-                        let lineText = (text as NSString).substring(with: lineRange)
-                        print("🔍 Line text: '\(lineText)'")
-                    }
-                } else {
-                    // For regular patterns, use the pattern as-is
-                    let regex = try NSRegularExpression(pattern: rule.pattern, options: [.caseInsensitive])
-                    let range = NSRange(location: 0, length: text.utf16.count)
-                    let matches = regex.matches(in: text, options: [], range: range)
-                    
-                    print("🔍 Found \(matches.count) matches for '\(rule.pattern)'")
-                    print("🔍 Text being searched: '\(text.prefix(100))...'")
-                    
-                    for match in matches.reversed() {
-                        let color = colorForRule(rule)
-                        
-                        // For partial patterns, highlight only the matched text
-                        attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: match.range)
-                        let matchedText = (text as NSString).substring(with: match.range)
-                        print("🔍 Highlighting partial match: '\(matchedText)'")
-                    }
+                    // Find the line boundaries and highlight the entire line
+                    let lineRange = findLineRange(for: match.range, in: text)
+                    attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: lineRange)
                 }
-            } catch {
-                // If regex fails, treat as literal text
-                let escapedPattern = NSRegularExpression.escapedPattern(for: rule.pattern)
-                do {
-                    let regex = try NSRegularExpression(pattern: escapedPattern, options: [.caseInsensitive])
-                    let range = NSRange(location: 0, length: text.utf16.count)
-                    let matches = regex.matches(in: text, options: [], range: range)
+            } else {
+                for match in matches.reversed() {
+                    let color = colorForRule(rule)
                     
-                    print("🔍 Found \(matches.count) literal matches for '\(rule.pattern)'")
-                    for match in matches.reversed() {
-                        let color = colorForRule(rule)
-                        attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: match.range)
-                    }
-                } catch {
-                    print("Error creating regex for pattern '\(rule.pattern)': \(error)")
+                    // For partial patterns, highlight only the matched text
+                    attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: match.range)
                 }
             }
         }
@@ -368,6 +336,111 @@ struct PernTerminalView: View {
             return .primary
         }
     }
+    
+    private func highlightPageMessages(in attributedString: NSMutableAttributedString, text: String) {
+        // Pattern to match page messages - both incoming and outgoing
+        let pagePatterns = [
+            // Incoming page: "Hashiren pages, \"message\""
+            "\\b\\w+\\s+pages,\\s+\"[^\"]*\"",
+            // Outgoing page: "You paged Hashiren with: message"
+            "You paged \\w+ with: .*",
+            // Alternative page format: "You paged Hashiren with: Michelina pages, \"message\""
+            "You paged \\w+ with: \\w+ pages, \"[^\"]*\""
+        ]
+        
+        for pattern in pagePatterns {
+            // Use cached regex
+            if let regex = highlightCache.getRegex(for: pattern) {
+                let searchRange = NSRange(location: 0, length: text.utf16.count)
+                let matches = regex.matches(in: text, options: [], range: searchRange)
+                
+                for match in matches.reversed() {
+                    // Find the line boundaries and highlight the entire line
+                    let lineRange = findLineRange(for: match.range, in: text)
+                    attributedString.addAttribute(.foregroundColor, value: NSColor.yellow, range: lineRange)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Highlight Cache System
+class HighlightCache: ObservableObject {
+    private var regexCache: [String: NSRegularExpression] = [:]
+    private var attributedStringCache: [String: NSAttributedString] = [:]
+    private let cacheQueue = DispatchQueue(label: "com.pernclient.regexcache", attributes: .concurrent)
+    var rulesHash: String = ""
+    private let maxCacheSize = 50 // Limit cache to prevent unbounded growth
+    
+    func getRegex(for pattern: String) -> NSRegularExpression? {
+        // Check cache first (thread-safe read)
+        return cacheQueue.sync {
+            if let cached = regexCache[pattern] {
+                return cached
+            }
+            
+            // Not cached, create new regex
+            do {
+                // Try as regex first
+                let regex = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+                
+                // Cache it (thread-safe write)
+                cacheQueue.async(flags: .barrier) { [weak self] in
+                    self?.regexCache[pattern] = regex
+                }
+                
+                return regex
+            } catch {
+                // If regex fails, try as literal
+                do {
+                    let escapedPattern = NSRegularExpression.escapedPattern(for: pattern)
+                    let regex = try NSRegularExpression(pattern: escapedPattern, options: [.caseInsensitive])
+                    
+                    cacheQueue.async(flags: .barrier) { [weak self] in
+                        self?.regexCache[pattern] = regex
+                    }
+                    
+                    return regex
+                } catch {
+                    return nil
+                }
+            }
+        }
+    }
+    
+    func getCachedAttributedString(for key: String) -> NSAttributedString? {
+        return cacheQueue.sync {
+            return attributedStringCache[key]
+        }
+    }
+    
+    func cacheAttributedString(_ attributedString: NSAttributedString, for key: String) {
+        cacheQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            
+            // Limit cache size to prevent unbounded growth
+            if self.attributedStringCache.count >= self.maxCacheSize {
+                // Remove oldest entries (simple FIFO)
+                let keysToRemove = Array(self.attributedStringCache.keys.prefix(10))
+                keysToRemove.forEach { self.attributedStringCache.removeValue(forKey: $0) }
+            }
+            
+            self.attributedStringCache[key] = attributedString
+        }
+    }
+    
+    func clearAttributedStringCache() {
+        cacheQueue.async(flags: .barrier) { [weak self] in
+            self?.attributedStringCache.removeAll()
+        }
+    }
+    
+    func clearCache() {
+        cacheQueue.async(flags: .barrier) { [weak self] in
+            self?.regexCache.removeAll()
+            self?.attributedStringCache.removeAll()
+        }
+    }
 }
 
 #Preview {
@@ -379,3 +452,4 @@ struct PernTerminalView: View {
     return PernTerminalView(connection: connection, connectionManager: connectionManager)
         .frame(width: 800, height: 600)
 }
+

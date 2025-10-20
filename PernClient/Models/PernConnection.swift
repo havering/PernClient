@@ -12,8 +12,10 @@ class PernConnection: ObservableObject, Identifiable {
     let id = UUID()
     @Published var isConnected = false
     @Published var isConnecting = false
-    @Published var lastActivity = Date()
+    var lastActivity = Date() // Not @Published - no need to trigger view updates
     @Published var outputBuffer = ""
+    // Configurable buffer limit - 0 means unlimited (use with caution on long sessions)
+    var maxOutputBufferSize: Int = 500_000 // Default: ~10,000 lines (500KB)
     @Published var inputText = ""
     @Published var needsCharacterCreation = false
     @Published var isGuestConnection = false
@@ -25,7 +27,7 @@ class PernConnection: ObservableObject, Identifiable {
     private var socketFD: Int32 = -1
     private var logFileHandle: FileHandle?
     private var keepaliveTimer: Timer?
-    private let keepaliveInterval: TimeInterval = 30.0 // Send keepalive every 30 seconds
+    private let keepaliveInterval: TimeInterval = 300.0 // Send keepalive every 5 minutes
     
     init(character: PernCharacter?, world: PernWorld) {
         self.character = character
@@ -291,7 +293,8 @@ class PernConnection: ObservableObject, Identifiable {
     func sendCommand(_ command: String) {
         guard isConnected else { return }
         
-        let data = (command + "\n").data(using: .utf8)!
+        let fullCommand = command + "\n"
+        let data = fullCommand.data(using: .utf8)!
         
         if socketFD != -1 {
             // Send via socket
@@ -300,13 +303,13 @@ class PernConnection: ObservableObject, Identifiable {
             }
             
             if bytesSent == -1 {
-                print("Send failed: \(errno)")
+                // Socket send failed
             }
         } else if let connection = connection {
             // Send via Network framework
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 if let error = error {
-                    print("Send failed: \(error)")
+                    // Network send failed
                 }
             })
         }
@@ -318,9 +321,8 @@ class PernConnection: ObservableObject, Identifiable {
         connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             if let data = data, !data.isEmpty {
                 let text = String(data: data, encoding: .utf8) ?? ""
-                print("Received data: \(text)")
                 DispatchQueue.main.async {
-                    self?.outputBuffer += text
+                    self?.appendToOutputBuffer(text)
                     self?.lastActivity = Date()
                     
                     // Log the received data if logging is enabled
@@ -356,10 +358,9 @@ class PernConnection: ObservableObject, Identifiable {
                 if bytesRead > 0 {
                     let data = Data(bytes: buffer, count: bytesRead)
                     let text = String(data: data, encoding: .utf8) ?? ""
-                    print("Received data from socket: \(text)")
                     
                     DispatchQueue.main.async {
-                        self.outputBuffer += text
+                        self.appendToOutputBuffer(text)
                         self.lastActivity = Date()
                         
                         // Notify about new message
@@ -406,12 +407,31 @@ class PernConnection: ObservableObject, Identifiable {
         }
     }
     
+    private func appendToOutputBuffer(_ newText: String) {
+        outputBuffer += newText
+        
+        // Only trim if buffer limit is set (non-zero) and exceeded
+        if maxOutputBufferSize > 0 && outputBuffer.count > maxOutputBufferSize {
+            // Keep only the last portion of the buffer, but try to break at a line boundary
+            let excess = outputBuffer.count - maxOutputBufferSize
+            let searchStart = outputBuffer.index(outputBuffer.startIndex, offsetBy: excess)
+            
+            if let lineBreakIndex = outputBuffer.range(of: "\n", range: searchStart..<outputBuffer.endIndex)?.upperBound {
+                outputBuffer = String(outputBuffer[lineBreakIndex...])
+            } else {
+                // If no line break found, just truncate
+                let keepCount = maxOutputBufferSize / 2
+                let startIndex = outputBuffer.index(outputBuffer.endIndex, offsetBy: -keepCount)
+                outputBuffer = String(outputBuffer[startIndex...])
+            }
+        }
+    }
+    
     private func notifyNewMessage(_ text: String) {
         // Only notify for meaningful messages (not empty or just whitespace)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
         
-        print("🔔 Notifying about new message: \(trimmedText)")
         
         // Get the connection manager to send notification
         // We'll need to pass this through the connection manager
@@ -432,12 +452,30 @@ struct PernCharacter: Identifiable, Codable, Hashable {
     var name: String
     var password: String
     var worldId: UUID
+    var isFavorite: Bool
+    
+    // Custom coding keys to handle backward compatibility
+    enum CodingKeys: String, CodingKey {
+        case id, name, password, worldId, isFavorite
+    }
 
-    init(name: String, password: String, worldId: UUID) {
+    init(name: String, password: String, worldId: UUID, isFavorite: Bool = false) {
         self.id = UUID()
         self.name = name
         self.password = password
         self.worldId = worldId
+        self.isFavorite = isFavorite
+    }
+    
+    // Custom decoder to handle missing isFavorite field in old data
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        password = try container.decode(String.self, forKey: .password)
+        worldId = try container.decode(UUID.self, forKey: .worldId)
+        // Default to false if isFavorite doesn't exist in saved data
+        isFavorite = try container.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
     }
 }
 

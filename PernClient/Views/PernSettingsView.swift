@@ -334,9 +334,9 @@ struct PernSettingsView: View {
                 List {
                     ForEach(connectionManager.characters) { character in
                         HStack(spacing: 16) {
-                            Image(systemName: "person.circle")
+                            Image(systemName: character.isFavorite ? "star.fill" : "person.circle")
                                 .font(.system(size: 24 * connectionManager.iconScale))
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(character.isFavorite ? .yellow : .accentColor)
                                 .frame(width: 30 * connectionManager.iconScale)
                             
                             VStack(alignment: .leading, spacing: 4) {
@@ -807,6 +807,7 @@ struct PernCharacterEditor: View {
     @State private var password: String
     @State private var selectedWorldId: UUID
     @State private var isAutoConnect: Bool
+    @State private var isFavorite: Bool
     
     init(connectionManager: PernConnectionManager, character: PernCharacter, onDismiss: @escaping () -> Void) {
         self.connectionManager = connectionManager
@@ -816,6 +817,7 @@ struct PernCharacterEditor: View {
         _password = State(initialValue: character.password)
         _selectedWorldId = State(initialValue: character.worldId)
         _isAutoConnect = State(initialValue: connectionManager.isAutoConnectEnabled(for: character))
+        _isFavorite = State(initialValue: character.isFavorite)
     }
     
     var body: some View {
@@ -890,6 +892,22 @@ struct PernCharacterEditor: View {
                         .foregroundColor(.secondary)
                 }
                 
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("Favorite")
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                        
+                        Spacer()
+                        
+                        Toggle("", isOn: $isFavorite)
+                    }
+                    
+                    Text("Add quick connect button for this character in the menu bar")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                
                 Spacer()
                 
                 // Save button
@@ -914,6 +932,7 @@ struct PernCharacterEditor: View {
         updatedCharacter.name = name
         updatedCharacter.password = password
         updatedCharacter.worldId = selectedWorldId
+        updatedCharacter.isFavorite = isFavorite
         
         connectionManager.saveCharacter(updatedCharacter)
         

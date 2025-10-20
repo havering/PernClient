@@ -26,6 +26,9 @@ struct PernMenuBar: View {
 
             Spacer()
 
+            // Favorite character quick connect buttons
+            FavoriteCharactersView(connectionManager: connectionManager)
+
             // Connection Status
             if let activeConnection = connectionManager.activeConnection {
                 HStack(spacing: 8) {
@@ -68,6 +71,44 @@ struct PernMenuBar: View {
         }
         .sheet(isPresented: $showingSettings) {
             PernSettingsView(connectionManager: connectionManager)
+        }
+    }
+}
+
+// Separate view for favorite characters to optimize rendering
+struct FavoriteCharactersView: View {
+    @ObservedObject var connectionManager: PernConnectionManager
+    
+    var favoriteCharacters: [PernCharacter] {
+        connectionManager.characters.filter { $0.isFavorite }
+    }
+    
+    var body: some View {
+        if !favoriteCharacters.isEmpty {
+            HStack(spacing: 8) {
+                ForEach(favoriteCharacters) { character in
+                    if let world = connectionManager.worlds.first(where: { $0.id == character.worldId }) {
+                        Button(action: {
+                            connectionManager.addConnection(character: character, world: world)
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "star.fill")
+                                    .font(.system(size: 12 * connectionManager.iconScale))
+                                    .foregroundColor(.yellow)
+                                Text(character.name)
+                                    .font(.system(size: connectionManager.fontSize - 1))
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.accentColor.opacity(0.2))
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .help("Quick connect to \(character.name) @ \(world.name)")
+                    }
+                }
+            }
+            .padding(.trailing, 8)
         }
     }
 }
