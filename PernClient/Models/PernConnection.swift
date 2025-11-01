@@ -37,9 +37,14 @@ class PernConnection: ObservableObject, Identifiable {
     private func startKeepalive() {
         stopKeepalive() // Stop any existing timer
         
-        keepaliveTimer = Timer.scheduledTimer(withTimeInterval: keepaliveInterval, repeats: true) { [weak self] _ in
+        // Use a common RunLoop mode timer to survive system sleep
+        let timer = Timer(timeInterval: keepaliveInterval, repeats: true) { [weak self] _ in
             self?.sendKeepalive()
         }
+        
+        // Add timer to common modes so it runs even during sleep/wake transitions
+        RunLoop.current.add(timer, forMode: .common)
+        keepaliveTimer = timer
         print("🔄 Keepalive timer started (every \(keepaliveInterval) seconds)")
     }
     
@@ -73,8 +78,12 @@ class PernConnection: ObservableObject, Identifiable {
         let port = NWEndpoint.Port(integerLiteral: UInt16(world.port))
         let endpoint = NWEndpoint.hostPort(host: host, port: port)
         
-        // Use the simplest possible connection
-        connection = NWConnection(to: endpoint, using: .tcp)
+        // Use TCP with explicit parameters to ensure keepalive is enabled
+        let params = NWParameters.tcp
+        let tcpOptions = NWProtocolTCP.Options()
+        params.defaultProtocolStack.internetProtocol = .init(tcpOptions)
+        
+        connection = NWConnection(to: endpoint, using: params)
         
         connection?.stateUpdateHandler = { [weak self] state in
             print("🔍 Connection state changed: \(state)")
@@ -85,7 +94,8 @@ class PernConnection: ObservableObject, Identifiable {
                            self?.isConnected = true
                            self?.isConnecting = false
                            self?.startReceiving()
-                           self?.startKeepalive() // Start keepalive timer
+                           // Start application-level keepalive for extra assurance
+                           self?.startKeepalive()
                            
                            // Auto-login if we have character credentials and it's not a guest connection
                            if let character = self?.character, 
@@ -160,6 +170,12 @@ class PernConnection: ObservableObject, Identifiable {
         
         // Set socket options
         var optval: Int32 = 1
+        
+        // Enable TCP keepalive to prevent disconnections during sleep/wake cycles
+        setsockopt(socketFD, SOL_SOCKET, SO_KEEPALIVE, &optval, socklen_t(MemoryLayout<Int32>.size))
+        print("✅ TCP keepalive enabled")
+        
+        // Disable SIGPIPE signals
         setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &optval, socklen_t(MemoryLayout<Int32>.size))
         
         // Keep socket in blocking mode for simplicity
@@ -207,7 +223,8 @@ class PernConnection: ObservableObject, Identifiable {
             self.isConnected = true
             self.isConnecting = false
             self.startReceivingFromSocket()
-            self.startKeepalive() // Start keepalive timer
+            // Start application-level keepalive for extra assurance
+            self.startKeepalive()
             
             // Auto-login if we have character credentials and it's not a guest connection
             if let character = self.character, 
@@ -221,7 +238,7 @@ class PernConnection: ObservableObject, Identifiable {
     }
     
     func disconnect() {
-        stopKeepalive() // Stop keepalive timer
+        stopKeepalive() // Stop keepalive timer (may not be running)
         if socketFD != -1 {
             close(socketFD)
             socketFD = -1

@@ -43,6 +43,7 @@ struct PernConnectionTabsView: View {
             // Tab Content
             if let activeConnection = connectionManager.activeConnection {
                 PernTerminalView(connection: activeConnection, connectionManager: connectionManager)
+                    .id(activeConnection.id) // Force recreation when connection changes
             } else {
                 Text("No active connection. Click '+' to add a new one.")
                     .font(.system(size: connectionManager.fontSize))

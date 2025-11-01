@@ -6,8 +6,16 @@ struct PernTerminalView: View {
     @FocusState private var isInputFocused: Bool
     @State private var scrollToBottom = false
     
-    // Regex caching for better performance
+    // Regex caching for better performance - each connection gets its own cache
     @StateObject private var highlightCache = HighlightCache()
+    @State private var lastProcessedTextLength: Int = 0
+    @State private var cachedAttributedString: NSAttributedString?
+    @State private var cachedTextLength: Int = 0
+    @State private var viewId = UUID()
+    
+    // Performance optimization: debounce scroll updates
+    private let scrollDebounceInterval: TimeInterval = 0.1 // Only scroll after 100ms of no updates
+    @State private var pendingScrollUpdate: DispatchWorkItem?
     
     var body: some View {
         VStack(spacing: 0) {
@@ -83,22 +91,32 @@ struct PernTerminalView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        highlightedText(connection.outputBuffer)
-                            .font(.system(size: connectionManager.fontSize, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .id("bottom")
+                        TerminalOutputView(
+                            text: connection.outputBuffer,
+                            fontSize: connectionManager.fontSize,
+                            highlightRules: connectionManager.highlightRules,
+                            highlightCache: highlightCache,
+                            cachedAttributedString: $cachedAttributedString,
+                            cachedTextLength: $cachedTextLength,
+                            lastProcessedTextLength: $lastProcessedTextLength
+                        )
+                        .id("bottom")
                     }
                 }
-                .onChange(of: connection.outputBuffer) {
-                    // Scroll without animation for better performance
+                .onAppear {
+                    // Scroll to bottom when view appears
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
-                .onChange(of: connectionManager.highlightRules.count) { _ in
-                    // Clear attributed string cache when rules change
+                .onChange(of: connection.outputBuffer) { _, newValue in
+                    // Debounce scroll to reduce frequency - only scroll after pause in updates
+                    debounceScrollUpdate(proxy: proxy)
+                }
+                .onChange(of: connectionManager.highlightRules.count) {
+                    // Clear all caches when rules change
                     highlightCache.clearAttributedStringCache()
+                    cachedAttributedString = nil
+                    cachedTextLength = 0
+                    lastProcessedTextLength = 0
                 }
                 .onTapGesture {
                     // Don't clear badge on click - let user manually clear by switching tabs
@@ -157,6 +175,11 @@ struct PernTerminalView: View {
         .onAppear {
             // Clear badge when user views this terminal
             connectionManager.notificationManager.clearBadgeForActiveConnection()
+            
+            // Restore focus after a brief delay to allow view to fully render
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isInputFocused = true
+            }
         }
         .onTapGesture {
             // Clear badge when user taps on terminal
@@ -172,6 +195,18 @@ struct PernTerminalView: View {
         }
     }
     
+    private func debounceScrollUpdate(proxy: ScrollViewProxy) {
+        // Cancel any pending scroll update
+        pendingScrollUpdate?.cancel()
+        
+        // Schedule a new scroll update
+        let workItem = DispatchWorkItem {
+            proxy.scrollTo("bottom", anchor: .bottom)
+        }
+        pendingScrollUpdate = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + scrollDebounceInterval, execute: workItem)
+    }
+    
     private func sendCommand() {
         guard !connection.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         
@@ -183,33 +218,206 @@ struct PernTerminalView: View {
         // Don't clear badge on command send - let user manually clear by switching tabs
     }
     
-    // MARK: - Highlighting Functions
-    private func highlightedText(_ text: String) -> some View {
-        let enabledRules = connectionManager.highlightRules.filter { $0.isEnabled }
-        
-        if enabledRules.isEmpty {
-            return AnyView(Text(text))
+}
+
+// MARK: - Terminal Output View (Optimized)
+struct TerminalOutputView: View {
+    let text: String
+    let fontSize: CGFloat
+    let highlightRules: [HighlightRule]
+    let highlightCache: HighlightCache
+    @Binding var cachedAttributedString: NSAttributedString?
+    @Binding var cachedTextLength: Int
+    @Binding var lastProcessedTextLength: Int
+    
+    @State private var displayedAttributedString: NSAttributedString?
+    @State private var isProcessing: Bool = false
+    @State private var currentProcessingTask: DispatchWorkItem?
+    
+    var body: some View {
+        Group {
+            if let displayed = displayedAttributedString {
+                Text(AttributedString(displayed))
+            } else {
+                // Show plain text immediately while processing highlights
+                Text(text)
+            }
         }
-        
-        // Check cache first
-        let cacheKey = "\(text.count)-\(enabledRules.map { $0.id.uuidString }.joined())"
-        
-        if let cached = highlightCache.getCachedAttributedString(for: cacheKey) {
-            return AnyView(Text(AttributedString(cached)))
+        .font(.system(size: fontSize, design: .monospaced))
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .onChange(of: text) { _, newText in
+            processHighlightsAsync(text: newText)
         }
-        
-        // Not in cache, create and cache it
-        let attributedString = createAttributedString(from: text, rules: enabledRules)
-        highlightCache.cacheAttributedString(attributedString, for: cacheKey)
-        
-        return AnyView(Text(AttributedString(attributedString)))
+        .onChange(of: highlightRules.count) {
+            // Rules changed, need to reprocess
+            displayedAttributedString = nil
+            processHighlightsAsync(text: text)
+        }
+        .onChange(of: cachedAttributedString) { _, newValue in
+            // Update displayed string when highlighting completes
+            if let newValue = newValue, cachedTextLength == text.count {
+                displayedAttributedString = newValue
+                isProcessing = false
+                currentProcessingTask = nil
+            }
+        }
+        .onAppear {
+            processHighlightsAsync(text: text)
+        }
     }
     
-    private func createAttributedString(from text: String, rules: [HighlightRule]) -> NSAttributedString {
+    private func processHighlightsAsync(text: String) {
+        let enabledRules = highlightRules.filter { $0.isEnabled }
+        let textLength = text.count
+        
+        // Fast path: No rules means no processing needed
+        if enabledRules.isEmpty {
+            displayedAttributedString = nil
+            return
+        }
+        
+        // Fast path: If we already have a cached result for this exact text length, reuse it immediately
+        if let cached = cachedAttributedString, cachedTextLength == textLength {
+            displayedAttributedString = cached
+            return
+        }
+        
+        // Cancel any existing processing task
+        if let existingTask = currentProcessingTask {
+            existingTask.cancel()
+        }
+        currentProcessingTask = nil
+        
+        // Don't start new processing if already processing the same text
+        guard !isProcessing || cachedTextLength != textLength else { return }
+        isProcessing = true
+        
+        // Capture current values
+        let currentLastProcessed = lastProcessedTextLength
+        let currentRules = enabledRules
+        
+        // Capture necessary values for background processing
+        let cache = highlightCache
+        
+        // Process on background thread
+        let workItem = DispatchWorkItem {
+            // Check if we can do incremental update
+            let canDoIncremental = textLength > currentLastProcessed && currentLastProcessed > 0
+            
+            let result: NSAttributedString
+            
+            if canDoIncremental {
+                // Get the cached base and append new text
+                let cacheKey = "attributed-\(currentLastProcessed)"
+                
+                if let baseAttributed = cache.getCachedAttributedString(for: cacheKey) {
+                    // Only process new text
+                    let newTextStart = text.index(text.startIndex, offsetBy: currentLastProcessed)
+                    let newText = String(text[newTextStart...])
+                    
+                    if !newText.isEmpty && newText.count < 100000 {
+                        result = Self.appendHighlightedText(base: baseAttributed, newText: newText, fullText: text, rules: currentRules, highlightCache: cache)
+                        
+                        // Cache the result
+                        let newCacheKey = "attributed-\(textLength)"
+                        cache.cacheAttributedString(result, for: newCacheKey)
+                    } else {
+                        // Fall back to full processing if incremental is too large
+                        result = Self.createAttributedString(from: text, rules: currentRules, highlightCache: cache)
+                        let cacheKey = "attributed-\(textLength)"
+                        cache.cacheAttributedString(result, for: cacheKey)
+                    }
+                } else {
+                    // No cached base, do full processing
+                    result = Self.createAttributedString(from: text, rules: currentRules, highlightCache: cache)
+                    let cacheKey = "attributed-\(textLength)"
+                    cache.cacheAttributedString(result, for: cacheKey)
+                }
+            } else {
+                // Full processing (first time or rules changed)
+                result = Self.createAttributedString(from: text, rules: currentRules, highlightCache: cache)
+                let cacheKey = "attributed-\(textLength)"
+                cache.cacheAttributedString(result, for: cacheKey)
+            }
+            
+            // Update UI on main thread
+            DispatchQueue.main.async {
+                // Use the bindings to update state
+                // Note: Cancellation check happens via workItem.cancel(), but we update here
+                // since the work already completed. If cancelled, we just won't start new work.
+                cachedAttributedString = result
+                cachedTextLength = textLength
+                lastProcessedTextLength = textLength
+            }
+        }
+        
+        // Store and execute work item
+        currentProcessingTask = workItem
+        DispatchQueue.global(qos: .userInitiated).async(execute: workItem)
+        
+        // Use onChange to update displayed string when cached value changes
+        // This is handled by the onChange in the body
+    }
+    
+    // Append and highlight only new text (static for background processing)
+    private static func appendHighlightedText(base: NSAttributedString, newText: String, fullText: String, rules: [HighlightRule], highlightCache: HighlightCache) -> NSAttributedString {
+        let result = NSMutableAttributedString(attributedString: base)
+        let startOffset = base.length
+        
+        // Append plain new text
+        result.append(NSAttributedString(string: newText))
+        
+        // Only highlight the new text portion
+        let newTextRange = NSRange(location: startOffset, length: newText.utf16.count)
+        
+        // Apply page message highlighting to new text only
+        Self.highlightPageMessagesInRange(in: result, text: fullText, range: newTextRange, highlightCache: highlightCache)
+        
+        // Apply user rules to new text only
+        let textLength = fullText.utf16.count
+        for rule in rules {
+            if let regex = highlightCache.getRegex(for: rule.pattern) {
+                let matches = regex.matches(in: fullText, options: [], range: newTextRange)
+                
+                let isFullLinePattern = rule.pattern.hasPrefix("^") && rule.pattern.hasSuffix("$")
+                
+                for match in matches.reversed() {
+                    // Validate match range
+                    guard match.range.location >= 0, match.range.location < textLength,
+                          match.range.location + match.range.length <= textLength else {
+                        continue
+                    }
+                    
+                    let color = Self.colorForRule(rule)
+                    
+                    if isFullLinePattern {
+                        let lineRange = Self.findLineRange(for: match.range, in: fullText)
+                        // Validate line range
+                        if lineRange.location >= 0 && lineRange.location + lineRange.length <= result.length {
+                            result.addAttribute(.foregroundColor, value: NSColor(color), range: lineRange)
+                        }
+                    } else {
+                        // Validate match range for attributed string
+                        if match.range.location >= 0 && match.range.location + match.range.length <= result.length {
+                            result.addAttribute(.foregroundColor, value: NSColor(color), range: match.range)
+                        }
+                    }
+                }
+            }
+        }
+        
+        return result
+    }
+    
+    private static func createAttributedString(from text: String, rules: [HighlightRule], highlightCache: HighlightCache) -> NSAttributedString {
         let attributedString = NSMutableAttributedString(string: text)
+        let textLength = text.utf16.count
         
         // Automatically highlight page messages in yellow
-        highlightPageMessages(in: attributedString, text: text)
+        Self.highlightPageMessages(in: attributedString, text: text, highlightCache: highlightCache)
         
         for rule in rules {
             // Get or create cached regex
@@ -219,23 +427,41 @@ struct PernTerminalView: View {
             // Check if this is a full-line pattern (starts with ^ and ends with $)
             let isFullLinePattern = rule.pattern.hasPrefix("^") && rule.pattern.hasSuffix("$")
             
-            let searchRange = NSRange(location: 0, length: text.utf16.count)
+            let searchRange = NSRange(location: 0, length: textLength)
             let matches = regex.matches(in: text, options: [], range: searchRange)
             
             if isFullLinePattern {
                 for match in matches.reversed() {
-                    let color = colorForRule(rule)
+                    // Validate match range
+                    guard match.range.location >= 0, match.range.location < textLength,
+                          match.range.location + match.range.length <= textLength else {
+                        continue
+                    }
+                    
+                    let color = Self.colorForRule(rule)
                     
                     // Find the line boundaries and highlight the entire line
-                    let lineRange = findLineRange(for: match.range, in: text)
-                    attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: lineRange)
+                    let lineRange = Self.findLineRange(for: match.range, in: text)
+                    
+                    // Validate line range
+                    if lineRange.location >= 0 && lineRange.location + lineRange.length <= attributedString.length {
+                        attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: lineRange)
+                    }
                 }
             } else {
                 for match in matches.reversed() {
-                    let color = colorForRule(rule)
+                    // Validate match range
+                    guard match.range.location >= 0, match.range.location < textLength,
+                          match.range.location + match.range.length <= textLength else {
+                        continue
+                    }
+                    
+                    let color = Self.colorForRule(rule)
                     
                     // For partial patterns, highlight only the matched text
-                    attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: match.range)
+                    if match.range.location >= 0 && match.range.location + match.range.length <= attributedString.length {
+                        attributedString.addAttribute(.foregroundColor, value: NSColor(color), range: match.range)
+                    }
                 }
             }
         }
@@ -243,7 +469,7 @@ struct PernTerminalView: View {
         return attributedString
     }
     
-    private func findLineRange(for matchRange: NSRange, in text: String) -> NSRange {
+    private static func findLineRange(for matchRange: NSRange, in text: String) -> NSRange {
         let textNSString = text as NSString
         
         // Find the start of the line
@@ -261,7 +487,7 @@ struct PernTerminalView: View {
         return NSRange(location: lineStart, length: lineEnd - lineStart)
     }
     
-    private func colorForRule(_ rule: HighlightRule) -> Color {
+    private static func colorForRule(_ rule: HighlightRule) -> Color {
         switch rule.color.lowercased() {
         // Basic Colors
         case "red": return .red
@@ -337,7 +563,22 @@ struct PernTerminalView: View {
         }
     }
     
-    private func highlightPageMessages(in attributedString: NSMutableAttributedString, text: String) {
+    private static func highlightPageMessages(in attributedString: NSMutableAttributedString, text: String, highlightCache: HighlightCache) {
+        highlightPageMessagesInRange(in: attributedString, text: text, range: NSRange(location: 0, length: text.utf16.count), highlightCache: highlightCache)
+    }
+    
+    private static func highlightPageMessagesInRange(in attributedString: NSMutableAttributedString, text: String, range: NSRange, highlightCache: HighlightCache) {
+        // Validate range bounds
+        let textLength = text.utf16.count
+        guard range.location >= 0, range.length >= 0, range.location <= textLength else {
+            return
+        }
+        
+        // Clamp range to text bounds
+        let clampedLocation = min(range.location, textLength)
+        let clampedLength = min(range.length, textLength - clampedLocation)
+        let validRange = NSRange(location: clampedLocation, length: clampedLength)
+        
         // Pattern to match page messages - both incoming and outgoing
         let pagePatterns = [
             // Incoming page: "Hashiren pages, \"message\""
@@ -351,13 +592,22 @@ struct PernTerminalView: View {
         for pattern in pagePatterns {
             // Use cached regex
             if let regex = highlightCache.getRegex(for: pattern) {
-                let searchRange = NSRange(location: 0, length: text.utf16.count)
-                let matches = regex.matches(in: text, options: [], range: searchRange)
+                let matches = regex.matches(in: text, options: [], range: validRange)
                 
                 for match in matches.reversed() {
+                    // Validate match range before processing
+                    guard match.range.location >= 0, match.range.location < textLength,
+                          match.range.location + match.range.length <= textLength else {
+                        continue
+                    }
+                    
                     // Find the line boundaries and highlight the entire line
-                    let lineRange = findLineRange(for: match.range, in: text)
-                    attributedString.addAttribute(.foregroundColor, value: NSColor.yellow, range: lineRange)
+                    let lineRange = Self.findLineRange(for: match.range, in: text)
+                    
+                    // Validate line range before applying attribute
+                    if lineRange.location >= 0 && lineRange.location + lineRange.length <= attributedString.length {
+                        attributedString.addAttribute(.foregroundColor, value: NSColor.yellow, range: lineRange)
+                    }
                 }
             }
         }
