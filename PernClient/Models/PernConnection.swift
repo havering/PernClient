@@ -7,15 +7,64 @@ extension Notification.Name {
     static let newMessageReceived = Notification.Name("newMessageReceived")
 }
 
+// MARK: - Output Ring Buffer
+/// Efficient ring buffer for output storage that avoids quadratic string concatenation
+final class OutputRing {
+    private var lines = [String]()
+    private let maxBytes: Int
+    private var currentBytes = 0
+    
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+    }
+    
+    func append(_ chunk: String) {
+        // Split into lines but keep newlines in the output
+        let lineParts = chunk.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" })
+        
+        for (index, part) in lineParts.enumerated() {
+            let line = String(part) + (index < lineParts.count - 1 ? "\n" : "")
+            lines.append(line)
+            currentBytes += line.utf8.count
+            
+            // Trim old lines if we exceed the limit
+            while currentBytes > maxBytes && !lines.isEmpty {
+                let removed = lines.removeFirst()
+                currentBytes -= removed.utf8.count
+            }
+        }
+    }
+    
+    var fullText: String {
+        lines.joined()
+    }
+    
+    var lineCount: Int {
+        lines.count
+    }
+}
+
 // MARK: - Pern Connection Models
 class PernConnection: ObservableObject, Identifiable {
     let id = UUID()
     @Published var isConnected = false
     @Published var isConnecting = false
     var lastActivity = Date() // Not @Published - no need to trigger view updates
-    @Published var outputBuffer = ""
+    
     // Configurable buffer limit - 0 means unlimited (use with caution on long sessions)
     var maxOutputBufferSize: Int = 500_000 // Default: ~10,000 lines (500KB)
+    
+    // Use ring buffer for efficient output storage
+    private let outputRing: OutputRing
+    
+    // Computed property for reading the buffer - no @Published needed
+    var outputBuffer: String {
+        outputRing.fullText
+    }
+    
+    // Publish change counter to trigger scroll updates  
+    @Published var outputChangeCount: Int = 0
+    
     @Published var inputText = ""
     @Published var needsCharacterCreation = false
     @Published var isGuestConnection = false
@@ -28,10 +77,18 @@ class PernConnection: ObservableObject, Identifiable {
     private var logFileHandle: FileHandle?
     private var keepaliveTimer: Timer?
     private let keepaliveInterval: TimeInterval = 300.0 // Send keepalive every 5 minutes
+    private var readSource: DispatchSourceRead?
+    private let logQueue = DispatchQueue(label: "com.pernclient.log", qos: .utility)
     
-    init(character: PernCharacter?, world: PernWorld) {
+    init(character: PernCharacter?, world: PernWorld, maxOutputBufferSize: Int = 500_000) {
         self.character = character
         self.world = world
+        self.maxOutputBufferSize = maxOutputBufferSize
+        self.outputRing = OutputRing(maxBytes: maxOutputBufferSize)
+    }
+    
+    deinit {
+        stopKeepalive() // Safety net to ensure timer cleanup
     }
     
     private func startKeepalive() {
@@ -42,8 +99,8 @@ class PernConnection: ObservableObject, Identifiable {
             self?.sendKeepalive()
         }
         
-        // Add timer to common modes so it runs even during sleep/wake transitions
-        RunLoop.current.add(timer, forMode: .common)
+        // Always add to main runloop for safety
+        RunLoop.main.add(timer, forMode: .common)
         keepaliveTimer = timer
         print("🔄 Keepalive timer started (every \(keepaliveInterval) seconds)")
     }
@@ -78,12 +135,8 @@ class PernConnection: ObservableObject, Identifiable {
         let port = NWEndpoint.Port(integerLiteral: UInt16(world.port))
         let endpoint = NWEndpoint.hostPort(host: host, port: port)
         
-        // Use TCP with explicit parameters to ensure keepalive is enabled
-        let params = NWParameters.tcp
-        let tcpOptions = NWProtocolTCP.Options()
-        params.defaultProtocolStack.internetProtocol = .init(tcpOptions)
-        
-        connection = NWConnection(to: endpoint, using: params)
+        // Use TCP - Network framework handles keepalive automatically
+        connection = NWConnection(to: endpoint, using: .tcp)
         
         connection?.stateUpdateHandler = { [weak self] state in
             print("🔍 Connection state changed: \(state)")
@@ -239,6 +292,7 @@ class PernConnection: ObservableObject, Identifiable {
     
     func disconnect() {
         stopKeepalive() // Stop keepalive timer (may not be running)
+        stopSocketReceiving() // Stop dispatch source reading
         if socketFD != -1 {
             close(socketFD)
             socketFD = -1
@@ -363,85 +417,80 @@ class PernConnection: ObservableObject, Identifiable {
     }
     
     private func startReceivingFromSocket() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        guard socketFD != -1 else { return }
+        
+        // Stop any existing read source
+        stopSocketReceiving()
+        
+        let source = DispatchSource.makeReadSource(fileDescriptor: socketFD, queue: .global(qos: .userInitiated))
+        readSource = source
+        
+        source.setEventHandler { [weak self] in
             guard let self = self else { return }
             
-            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
-            defer { buffer.deallocate() }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let bytesRead = read(self.socketFD, &buffer, buffer.count)
             
-            while self.isConnected && self.socketFD != -1 {
-                let bytesRead = read(self.socketFD, buffer, 4096)
+            if bytesRead > 0 {
+                let text = String(decoding: buffer.prefix(bytesRead), as: UTF8.self)
                 
-                if bytesRead > 0 {
-                    let data = Data(bytes: buffer, count: bytesRead)
-                    let text = String(data: data, encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    self.appendToOutputBuffer(text)
+                    self.lastActivity = Date()
                     
-                    DispatchQueue.main.async {
-                        self.appendToOutputBuffer(text)
-                        self.lastActivity = Date()
-                        
-                        // Notify about new message
-                        self.notifyNewMessage(text)
-                        
-                        // Log the received data if logging is enabled
-                        if self.isLogging {
-                            self.logToFile(text)
-                        }
+                    if self.isLogging {
+                        self.logToFile(text)
                     }
-                } else if bytesRead == 0 {
-                    // Connection closed
-                    print("Socket connection closed by server")
-                    DispatchQueue.main.async {
-                        self.isConnected = false
-                        self.isConnecting = false
-                    }
-                    break
-                } else {
-                    // Error
-                    let error = errno
-                    if error == EAGAIN || error == EWOULDBLOCK {
-                        // This is normal for non-blocking sockets - no data available yet
-                        usleep(100000) // Sleep 100ms before trying again
-                        continue
-                    } else {
-                        print("❌ Socket read error: \(error)")
-                        DispatchQueue.main.async {
-                            self.isConnected = false
-                            self.isConnecting = false
-                        }
-                        break
-                    }
+                    
+                    self.notifyNewMessage(text)
+                }
+            } else if bytesRead == 0 {
+                // Connection closed by server
+                print("Socket connection closed by server")
+                DispatchQueue.main.async {
+                    self.isConnected = false
+                    self.isConnecting = false
+                }
+            } else {
+                // Error reading from socket
+                let error = errno
+                print("❌ Socket read error: \(error)")
+                DispatchQueue.main.async {
+                    self.isConnected = false
+                    self.isConnecting = false
                 }
             }
         }
+        
+        source.setCancelHandler {
+            // Cleanup happens in disconnect()
+        }
+        
+        source.resume()
+        print("✅ Socket read source started")
+    }
+    
+    private func stopSocketReceiving() {
+        readSource?.cancel()
+        readSource = nil
+        print("✅ Socket read source stopped")
     }
     
     private func logToFile(_ text: String) {
         guard let logFileHandle = logFileHandle else { return }
         
         if let data = text.data(using: .utf8) {
-            logFileHandle.write(data)
+            logQueue.async {
+                logFileHandle.write(data)
+            }
         }
     }
     
     private func appendToOutputBuffer(_ newText: String) {
-        outputBuffer += newText
+        outputRing.append(newText)
         
-        // Only trim if buffer limit is set (non-zero) and exceeded
-        if maxOutputBufferSize > 0 && outputBuffer.count > maxOutputBufferSize {
-            // Keep only the last portion of the buffer, but try to break at a line boundary
-            let excess = outputBuffer.count - maxOutputBufferSize
-            let searchStart = outputBuffer.index(outputBuffer.startIndex, offsetBy: excess)
-            
-            if let lineBreakIndex = outputBuffer.range(of: "\n", range: searchStart..<outputBuffer.endIndex)?.upperBound {
-                outputBuffer = String(outputBuffer[lineBreakIndex...])
-            } else {
-                // If no line break found, just truncate
-                let keepCount = maxOutputBufferSize / 2
-                let startIndex = outputBuffer.index(outputBuffer.endIndex, offsetBy: -keepCount)
-                outputBuffer = String(outputBuffer[startIndex...])
-            }
-        }
+        // Trigger view update and scroll without regenerating the full string
+        outputChangeCount += 1
     }
     
     private func notifyNewMessage(_ text: String) {
@@ -449,18 +498,13 @@ class PernConnection: ObservableObject, Identifiable {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
         
-        
-        // Get the connection manager to send notification
-        // We'll need to pass this through the connection manager
-        NotificationCenter.default.post(
-            name: .newMessageReceived,
-            object: self,
-            userInfo: [
-                "connection": isGuestConnection ? "Guest @ \(world.name)" : "\(character?.name ?? "Unknown") @ \(world.name)",
-                "connectionId": id,
-                "message": text
-            ]
+        // Post to deterministic notification bus (also bridges to NotificationCenter)
+        let event = NewMessageEvent(
+            connection: isGuestConnection ? "Guest @ \(world.name)" : "\(character?.name ?? "Unknown") @ \(world.name)",
+            connectionId: id,
+            message: text
         )
+        PernNotificationBus.shared.postNewMessage(event)
     }
 }
 

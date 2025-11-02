@@ -107,8 +107,8 @@ struct PernTerminalView: View {
                     // Scroll to bottom when view appears
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
-                .onChange(of: connection.outputBuffer) { _, newValue in
-                    // Debounce scroll to reduce frequency - only scroll after pause in updates
+                .onChange(of: connection.outputChangeCount) {
+                    // Trigger debounced scroll when output buffer changes
                     debounceScrollUpdate(proxy: proxy)
                 }
                 .onChange(of: connectionManager.highlightRules.count) {
@@ -267,13 +267,19 @@ struct TerminalOutputView: View {
         .onAppear {
             processHighlightsAsync(text: text)
         }
+        .onDisappear {
+            // Cancel any background processing when view disappears
+            currentProcessingTask?.cancel()
+            currentProcessingTask = nil
+            isProcessing = false
+        }
     }
     
     private func processHighlightsAsync(text: String) {
         let enabledRules = highlightRules.filter { $0.isEnabled }
         let textLength = text.count
         
-        // Fast path: No rules means no processing needed
+        // Fast path: No rules means no processing needed (early return)
         if enabledRules.isEmpty {
             displayedAttributedString = nil
             return
@@ -296,26 +302,35 @@ struct TerminalOutputView: View {
         isProcessing = true
         
         // Capture current values
-        let currentLastProcessed = lastProcessedTextLength
+        var currentLastProcessed = lastProcessedTextLength
         let currentRules = enabledRules
+        
+        // Chunk guard: If new text exceeds threshold, force full processing
+        let newTextSize = textLength - currentLastProcessed
+        let largeChunkThreshold = 100_000 // chars
+        if newTextSize > largeChunkThreshold && currentLastProcessed > 0 {
+            // Skip incremental processing for very large chunks
+            currentLastProcessed = 0 // Force full reprocess instead of incremental
+        }
         
         // Capture necessary values for background processing
         let cache = highlightCache
+        let finalLastProcessed = currentLastProcessed // Capture for background task
         
         // Process on background thread
         let workItem = DispatchWorkItem {
             // Check if we can do incremental update
-            let canDoIncremental = textLength > currentLastProcessed && currentLastProcessed > 0
+            let canDoIncremental = textLength > finalLastProcessed && finalLastProcessed > 0
             
             let result: NSAttributedString
             
             if canDoIncremental {
                 // Get the cached base and append new text
-                let cacheKey = "attributed-\(currentLastProcessed)"
+                let cacheKey = "attributed-\(finalLastProcessed)"
                 
                 if let baseAttributed = cache.getCachedAttributedString(for: cacheKey) {
                     // Only process new text
-                    let newTextStart = text.index(text.startIndex, offsetBy: currentLastProcessed)
+                    let newTextStart = text.index(text.startIndex, offsetBy: finalLastProcessed)
                     let newText = String(text[newTextStart...])
                     
                     if !newText.isEmpty && newText.count < 100000 {

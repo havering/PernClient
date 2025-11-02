@@ -7,6 +7,7 @@ class PernNotificationManager: NSObject, ObservableObject {
     @Published var isAppActive = true
     
     private let notificationCenter = UNUserNotificationCenter.current()
+    private var tokens = [NSObjectProtocol]()
     
     override init() {
         super.init()
@@ -15,12 +16,17 @@ class PernNotificationManager: NSObject, ObservableObject {
         
     }
     
+    deinit {
+        // Clean up notification observers
+        tokens.forEach(NotificationCenter.default.removeObserver)
+    }
+    
     private func setupNotificationCenter() {
         notificationCenter.delegate = self
     }
     
     private func setupAppStateObservers() {
-        NotificationCenter.default.addObserver(
+        tokens.append(NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
@@ -28,15 +34,15 @@ class PernNotificationManager: NSObject, ObservableObject {
             self?.isAppActive = true
             // Clear badge when app becomes active (user returned to the app)
             self?.clearBadgeForActiveConnection()
-        }
+        })
         
-        NotificationCenter.default.addObserver(
+        tokens.append(NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             self?.isAppActive = false
-        }
+        })
     }
     
     func requestNotificationPermission() {

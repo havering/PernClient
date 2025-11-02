@@ -15,6 +15,7 @@ class PernConnectionManager: ObservableObject {
     
     let notificationManager = PernNotificationManager()
     private var notificationObserver: NSObjectProtocol?
+    private let keychainManager = PernKeychainManager.shared
 
     private let userDefaults = UserDefaults.standard
     private let worldsKey = "PernWorlds"
@@ -27,6 +28,9 @@ class PernConnectionManager: ObservableObject {
     private let darkModeKey = "PernDarkMode"
 
     init() {
+        // Migrate passwords from UserDefaults to Keychain on first launch
+        keychainManager.migratePasswordsIfNeeded()
+        
         loadData()
         setupDefaultHighlightRules()
         notificationManager.requestNotificationPermission()
@@ -204,11 +208,15 @@ class PernConnectionManager: ObservableObject {
     }
     
     func deleteCharacter(_ character: PernCharacter) {
+        // Delete password from Keychain
+        keychainManager.deletePassword(for: character.id)
         characters.removeAll { $0.id == character.id }
         saveData()
     }
     
     func removeCharacter(_ character: PernCharacter) {
+        // Delete password from Keychain
+        keychainManager.deletePassword(for: character.id)
         characters.removeAll { $0.id == character.id }
         saveData()
     }
@@ -351,7 +359,14 @@ class PernConnectionManager: ObservableObject {
         
         if let charactersData = userDefaults.data(forKey: charactersKey),
            let decodedCharacters = try? JSONDecoder().decode([PernCharacter].self, from: charactersData) {
-            characters = decodedCharacters
+            // Load passwords from Keychain for each character
+            characters = decodedCharacters.map { character in
+                var updatedCharacter = character
+                if let keychainPassword = keychainManager.getPassword(for: character.id) {
+                    updatedCharacter.password = keychainPassword
+                }
+                return updatedCharacter
+            }
             print("💾 Loaded \(characters.count) characters")
             for character in characters {
                 print("💾 Character: \(character.name) for world: \(character.worldId)")
@@ -408,7 +423,21 @@ class PernConnectionManager: ObservableObject {
             print("💾 Saved \(worlds.count) worlds")
         }
         
-        if let charactersData = try? JSONEncoder().encode(characters) {
+        // Save passwords to Keychain and characters to UserDefaults without passwords
+        for character in characters {
+            if !character.password.isEmpty {
+                keychainManager.savePassword(character.password, for: character.id)
+            }
+        }
+        
+        // Save characters to UserDefaults with empty passwords (passwords are in Keychain)
+        let charactersWithoutPasswords = characters.map { character in
+            var characterWithoutPassword = character
+            characterWithoutPassword.password = ""
+            return characterWithoutPassword
+        }
+        
+        if let charactersData = try? JSONEncoder().encode(charactersWithoutPasswords) {
             userDefaults.set(charactersData, forKey: charactersKey)
             print("💾 Saved \(characters.count) characters")
         }
